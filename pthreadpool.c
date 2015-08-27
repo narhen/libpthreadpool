@@ -3,14 +3,13 @@
 #include <string.h>
 #include <signal.h>
 #include <pthread.h>
+
 #include <pthreadpool.h>
+#include <list.h>
 
 #define DROP_THREAD ((void (*)(void *))-1)
-
-struct job_list {
-	struct job_list *next, *prev;
-	struct job *job;
-};
+#define TO_THREAD(x) ((struct thread *)(x))
+#define TO_JOB(x) ((struct job *)(x))
 
 struct job {
 	void (*task)(void *arg);
@@ -18,7 +17,6 @@ struct job {
 };
 
 struct thread {
-	struct thread *next, *prev;
 	int id;
 	pthread_t thread;
 	struct pthreadpool *pool;
@@ -28,13 +26,13 @@ struct pthreadpool {
 	volatile int run; /* set to 0 if threads are to terminate */
 	volatile int num_free_jobs;
 	volatile int jobs_in_progress;
-	struct job_list jobs;
+	struct list job_list;
 
-	pthread_mutex_t lock; // used when accessing any member of this struct
-	pthread_cond_t cond; // used when threads are waiting for jobs
-	pthread_mutex_t pause_lock; // used when threads are paused
-	pthread_cond_t pause_cond; // used when threas are paused
-	struct thread threads;
+	pthread_mutex_t lock; /* used when accessing members of this struct */
+	pthread_cond_t cond; /* used when threads are waiting for jobs */
+	pthread_mutex_t pause_lock; /* used when threads are paused */
+	pthread_cond_t pause_cond; /* used when threas are paused */
+	struct list threads;
 	int num_threads;
 
 	int max_thread_id;
@@ -48,37 +46,9 @@ static struct thread *get_thread_struct(void)
 	return thread_data;
 }
 
-/* must be called in a locked context */
-static void add_tail(struct job_list *list, struct job_list *new)
-{
-	struct job_list *tail;
-
-	tail = list->prev;
-	new->next = tail->next;
-	new->prev = tail;
-	tail->next = new;
-	list->prev = new;
-}
-
-/* must be called in a locked context */
-static void add_head(struct job_list *list, struct job_list *new)
-{
-	new->next = list->next;
-	new->prev = list;
-	list->next->prev = new;
-	list->next = new;
-}
-
-/* must be called in a locked context */
-static void unlink_node(struct job_list *j)
-{
-	j->next->prev = j->prev;
-	j->prev->next = j->next;
-}
-
 static struct job *get_job(struct pthreadpool *pool)
 {
-	struct job_list *tmp;
+	struct list *lentry;
 	struct job *ret = NULL;
 
 	pthread_mutex_lock(&pool->lock);
@@ -86,10 +56,10 @@ static struct job *get_job(struct pthreadpool *pool)
 		pthread_cond_wait(&pool->cond, &pool->lock);
 
 	if (pool->run && pool->num_free_jobs > 0) {
-		tmp = pool->jobs.next;
-		unlink_node(tmp);
-		ret = tmp->job;
-		free(tmp);
+		lentry = pool->job_list.next;
+		list_remove(lentry);
+		ret = TO_JOB(lentry->data);
+		free(lentry);
 
 		--pool->num_free_jobs;
 	}
@@ -114,26 +84,28 @@ static void report_done(struct pthreadpool *pool)
 
 static void clear_jobs_list(struct pthreadpool *pool)
 {
-	struct job_list *ptr, *next;
+	struct list *lptr, *tmp;
+	struct job *job;
 
 	pthread_mutex_lock(&pool->lock);
 
-	for (ptr = pool->jobs.next; ptr != &pool->jobs; ptr = next) {
-		next = ptr->next;
-
-		if (ptr->job->task != DROP_THREAD) {
-			unlink_node(ptr);
-			free(ptr->job);
-			free(ptr);
+	list_for_each_tsafe(&pool->job_list, lptr, tmp) {
+		job = TO_JOB(lptr->data);
+		if (job->task != DROP_THREAD) {
+			list_remove(lptr);
+			free(job);
+			free(lptr);
 		}
 	}
 
+	pool->num_free_jobs = 0;
 	pthread_mutex_unlock(&pool->lock);
 }
 
 static void pause_thread(int sig)
 {
 	struct thread *th = get_thread_struct();
+
 	pthread_mutex_lock(&th->pool->pause_lock);
 	pthread_cond_wait(&th->pool->pause_cond, &th->pool->pause_lock);
 	pthread_mutex_unlock(&th->pool->pause_lock);
@@ -145,7 +117,7 @@ static void *loiter(void *arg)
 	struct thread *thinfo = (struct thread *)arg;
 	struct sigaction act;
 
-	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL); 
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = pause_thread;
 	sigaction(SIGUSR1, &act, NULL);
@@ -169,34 +141,32 @@ static void *loiter(void *arg)
 		free(job);
 	}
 
-	pthread_mutex_lock(&thinfo->pool->lock);
-	thinfo->pool->num_threads--;
-	pthread_mutex_unlock(&thinfo->pool->lock);
-
 	return NULL;
 }
 
 static int add_threads(struct pthreadpool *pool, int num)
 {
 	int i;
-	struct thread *thread_tmp, *tmp;
+	struct list *lptr;
+	struct thread *new;
 
-	tmp = &pool->threads;
+	pthread_mutex_lock(&pool->lock);
 	for (i = 0; i < num; i++) {
-		thread_tmp = malloc(sizeof(struct thread));
-		thread_tmp->id = pool->max_thread_id++;
-		thread_tmp->pool = pool;
+		new = malloc(sizeof(struct thread));
+		new->id = pool->max_thread_id++;
+		new->pool = pool;
 
-		/* add the new thread to the threadlist */
-		thread_tmp->next = tmp;
-		thread_tmp->prev = tmp->prev;
-		tmp->prev->next = thread_tmp;
-		tmp->prev = thread_tmp;
+		/* XXX add the new thread to the threadlist */
+		lptr = malloc(sizeof(struct list));
+		lptr->data = new;
+		list_add_tail(&pool->threads, lptr);
 
-		pthread_create(&thread_tmp->thread, NULL, loiter, (void *)thread_tmp);
+		pthread_create(&new->thread, NULL, loiter, (void *)new);
 	}
 
 	pool->num_threads += i;
+	pthread_mutex_unlock(&pool->lock);
+
 	return i;
 }
 
@@ -204,16 +174,16 @@ static int add_threads(struct pthreadpool *pool, int num)
 #define HEAD 0
 static void _put_job(struct pthreadpool *pool, struct job *j, int where)
 {
-	struct job_list *new;
+	struct list *new;
+
+	new = malloc(sizeof(struct list));
+	new->data = j;
 
 	pthread_mutex_lock(&pool->lock);
-	new = malloc(sizeof(struct job_list));
-	new->job = j;
-
 	if (where != HEAD)
-		add_tail(&pool->jobs, new);
+		list_add_tail(&pool->job_list, new);
 	else
-		add_head(&pool->jobs, new);
+		list_add_head(&pool->job_list, new);
 	++pool->num_free_jobs;
 
 	pthread_mutex_unlock(&pool->lock);
@@ -225,6 +195,9 @@ struct pthreadpool *pthreadpool_init(int pool_size)
 {
 	struct pthreadpool *ret;
 
+	if (pool_size < 0)
+		return NULL;
+
 	ret = malloc(sizeof(struct pthreadpool));
 	ret->run = 1;
 	ret->num_free_jobs = 0;
@@ -232,13 +205,13 @@ struct pthreadpool *pthreadpool_init(int pool_size)
 	ret->num_threads = 0;
 	ret->max_thread_id = 1;
 
-	thread_data = NULL;
+	list_init(&ret->job_list);
+	list_init(&ret->threads);
 
-	ret->jobs.next = ret->jobs.prev = &ret->jobs;
-	ret->threads.next = ret->threads.prev = &ret->threads;
 	pthread_mutex_init(&ret->lock, NULL);
 	pthread_cond_init(&ret->cond, NULL);
 
+	thread_data = NULL;
 	add_threads(ret, pool_size);
 
 	return ret;
@@ -257,19 +230,25 @@ int pthreadpool_more_threads(struct pthreadpool *pool, int num_threads)
 }
 
 /* Add more threads to a threadpool.
- * @param num_threads is the number of threads to add to the pool
- * Returns the number of threads to be removed
+ * @param num_threads is the number of threads to remove from the pool
+ * Returns the number of threads that are removed
  */
 int pthreadpool_less_threads(struct pthreadpool *pool, int num_threads)
 {
-	int i;
+	int i, pool_size;
 	struct job *job;
 
 	if (num_threads <= 0)
 		return 0;
 
-	if (num_threads > pool->num_threads)
-		num_threads = pool->num_threads;
+	pthread_mutex_lock(&pool->lock);
+	pool_size = pool->num_threads;
+
+	if (num_threads > pool_size)
+		num_threads = pool_size;
+
+	pool->num_threads -= num_threads;
+	pthread_mutex_unlock(&pool->lock);
 
 	for (i = 0; i < num_threads; i++) {
 		job = malloc(sizeof(struct job));
@@ -302,7 +281,7 @@ int pthreadpool_remaining(struct pthreadpool *pool)
 }
 
 /* Returns the number of jobs in progress */
-int pthreadpool_in_progess(struct pthreadpool *pool)
+int pthreadpool_in_progress(struct pthreadpool *pool)
 {
 	return pool->jobs_in_progress;
 }
@@ -311,36 +290,42 @@ int pthreadpool_in_progess(struct pthreadpool *pool)
 */
 int pthreadpool_size(struct pthreadpool *pool)
 {
-	return pool->num_threads;
+	int ret;
+
+	ret = pool->num_threads;
+
+	return ret;
 }
 
 /* Frees all resources allocated by the threadpool, including all threads and
  * the thread pool itself */
 void pthreadpool_shutdown(struct pthreadpool *pool, int force_kill)
 {
-	struct job_list *ptr, *next;
-	struct thread *tmp, *tmpnext;
+	struct list *lptr, *tmp;
+	struct job *j;
+	struct thread *th;
 
 	pool->run = 0;
 	pthread_cond_broadcast(&pool->cond);
 
-	for (tmp = pool->threads.next; tmp != &pool->threads; tmp = tmpnext) {
-		tmpnext = tmp->next;
-		tmp->next->prev = tmp->prev;
-		tmp->prev->next = tmp->next;
+	list_for_each_tsafe(&pool->threads, lptr, tmp) {
+		list_remove(lptr);
+		th = TO_THREAD(lptr->data);
 
 		if (force_kill)
-			pthread_cancel(tmp->thread);
-		pthread_join(tmp->thread, NULL);
+			pthread_cancel(th->thread);
+		pthread_join(th->thread, NULL);
 
-		free(tmp);
+		free(th);
+		free(lptr);
 	}
 	pthread_mutex_destroy(&pool->lock);
 
-	// clean up after any left over jobs
-	for (ptr = pool->jobs.next; ptr != &pool->jobs; ptr = next) {
-		next = ptr->next;
-		free(ptr);
+	/* clean up after any left over jobs */
+	list_for_each_tsafe(&pool->job_list, lptr, tmp) {
+		j = TO_JOB(lptr->data);
+		free(j);
+		free(lptr);
 	}
 
 	free(pool);
@@ -353,19 +338,21 @@ void pthreadpool_reset(struct pthreadpool *pool)
 }
 
 /* Pauses the execution of all threads in the pool
- */
+*/
 void pthreadpool_pause(struct pthreadpool *pool)
 {
-	struct thread *ptr;
+	struct list *lptr;
 
 	pthread_mutex_lock(&pool->lock);
 
-	for (ptr = pool->threads.next; ptr != &pool->threads; ptr = ptr->next)
-		pthread_kill(ptr->thread, SIGUSR1);
+	list_for_each(&pool->threads, lptr)
+		pthread_kill(TO_THREAD(lptr->data)->thread, SIGUSR1);
 
 	pthread_mutex_unlock(&pool->lock);
 }
 
+/* Resume all paused threads
+*/
 void pthreadpool_resume(struct pthreadpool *pool)
 {
 	pthread_cond_broadcast(&pool->pause_cond);

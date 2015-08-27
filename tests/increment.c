@@ -35,7 +35,7 @@ int main(int argc, char *argv[])
 	for (i = 0; i < nr_jobs; i++)
 		pthreadpool_put(pool, increment, &count);
 
-	while (pthreadpool_remaining(pool) > 0 || pthreadpool_in_progess(pool) > 0)
+	while (pthreadpool_remaining(pool) > 0 || pthreadpool_in_progress(pool) > 0)
 		usleep(100);
 
 	pthreadpool_shutdown(pool, 0);
